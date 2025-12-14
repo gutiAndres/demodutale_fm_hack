@@ -1,0 +1,109 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8" /><title>ANE FM Player (Opus->PCM server)</title></head>
+<body>
+  <button id="start">Start Audio</button>
+  <pre id="log"></pre>
+
+<script>
+const SENSOR_ID = "ANE1";
+const WS_URL = `ws://localhost:8000/ws/listen/${SENSOR_ID}`;
+const logEl = document.getElementById("log");
+const log = (s) => (logEl.textContent += s + "\n");
+
+let audioCtx, ws;
+let nextPlayTime = 0;
+let started = false;
+
+let sampleRate = 48000;
+let queue = [];
+const TARGET_BUFFER_FRAMES = 10; // 200 ms
+
+let framesRx = 0;
+let t0 = performance.now();
+
+function pcmLEToFloat32(ab, offset, samples) {
+  const dv = new DataView(ab, offset);
+  const out = new Float32Array(samples);
+  let acc = 0;
+  for (let i = 0; i < samples; i++) {
+    const v = dv.getInt16(i*2, true);
+    const f = v / 32768.0;
+    out[i] = f;
+    acc += f*f;
+  }
+  return { out, rms: Math.sqrt(acc / samples) };
+}
+
+function scheduleFrame(float32pcm) {
+  const buf = audioCtx.createBuffer(1, float32pcm.length, sampleRate);
+  buf.copyToChannel(float32pcm, 0);
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+
+  const now = audioCtx.currentTime;
+  if (nextPlayTime < now) nextPlayTime = now + 0.05;
+  src.start(nextPlayTime);
+  nextPlayTime += buf.duration;
+}
+
+function pump() {
+  if (!started) return;
+  if (queue.length < TARGET_BUFFER_FRAMES) return;
+  while (queue.length > 0) scheduleFrame(queue.shift());
+}
+
+document.getElementById("start").onclick = async () => {
+  document.getElementById("start").disabled = true;
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  await audioCtx.resume();
+  log("[UI] AudioContext listo.");
+
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => log("[UI] WS conectado: " + WS_URL);
+  ws.onclose = () => log("[UI] WS cerrado.");
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      log("[UI] Config: " + ev.data);
+      try {
+        const cfg = JSON.parse(ev.data);
+        sampleRate = cfg.sample_rate || 48000;
+      } catch {}
+      started = true;
+      return;
+    }
+
+    const ab = ev.data;
+    const dv = new DataView(ab);
+
+    // Header PCM: magic(4) seq(4) sample_rate(4) channels(2) samples(2) big-endian
+    const sr = dv.getUint32(8, false);
+    const ns = dv.getUint16(14, false);
+    if (sr) sampleRate = sr;
+
+    const { out, rms } = pcmLEToFloat32(ab, 16, ns);
+    queue.push(out);
+    pump();
+
+    framesRx++;
+    const now = performance.now();
+    if (now - t0 >= 1000) {
+      log(`[UI] frames/s=${framesRx} queue=${queue.length} rms~${rms.toFixed(4)}`);
+      framesRx = 0;
+      t0 = now;
+    }
+  };
+
+  setInterval(() => {
+    if (ws && ws.readyState === 1) ws.send("ping");
+  }, 5000);
+};
+</script>
+</body>
+</html>
