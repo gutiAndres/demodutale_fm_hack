@@ -30,8 +30,8 @@ TCP_PORT = 8000
 # RTP payload type
 PT = 96
 
-# Formato del header del motor C
-HDR_FMT  = "!IIIHH"  # magic, seq, sample_rate, channels, payload_len
+# Header del motor C: (magic, seq, sample_rate, channels, payload_len)
+HDR_FMT  = "!IIIHH"
 HDR_SIZE = struct.calcsize(HDR_FMT)
 MAGIC    = 0x4F505530  # 'OPU0'
 
@@ -40,15 +40,24 @@ DEFAULT_FRAME_MS = 20
 
 RETRY_SECONDS = 2
 
+# Cola global que desacopla TCP (siempre arriba) de WebRTC (puede reconectar)
+# maxsize ~ 200 frames = ~4s si frame_ms=20
+OPUS_QUEUE_MAX = 200
+opus_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=OPUS_QUEUE_MAX)
+
+# Límite razonable de tamaño de frame Opus (evita desincronización por plen corrupto)
+MAX_OPUS_FRAME_BYTES = 4096
+
 Gst.init(None)
 
 # =========================
 # Pipeline: appsrc -> opusparse -> rtpopuspay -> webrtcbin
+# Nota: ponemos do-timestamp=false y manejamos PTS/DUR nosotros, determinista.
 # =========================
 PIPELINE_DESC = f"""
 webrtcbin name=wb bundle-policy=max-bundle stun-server="{STUN_SERVER}"
 
-appsrc name=opussrc is-live=true format=time do-timestamp=true !
+appsrc name=opussrc is-live=true format=time do-timestamp=false !
   queue !
   opusparse !
   rtpopuspay pt={PT} !
@@ -57,14 +66,20 @@ appsrc name=opussrc is-live=true format=time do-timestamp=true !
   wb.
 """
 
+
 def sdp_to_text(sdp_msg) -> str:
     try:
         return sdp_msg.as_text()
     except Exception:
         return sdp_msg.to_string()
 
+
 def sdp_extract_lines(sdp_text: str):
-    want_prefix = ("m=audio", "a=rtpmap", "a=fmtp", "a=ice-ufrag", "a=ice-pwd", "a=fingerprint", "a=setup")
+    want_prefix = (
+        "m=audio", "a=rtpmap", "a=fmtp",
+        "a=ice-ufrag", "a=ice-pwd",
+        "a=fingerprint", "a=setup"
+    )
     out = []
     for ln in sdp_text.splitlines():
         if ln.startswith(want_prefix):
@@ -78,7 +93,7 @@ class Publisher:
     - negocia SDP/ICE via WebSocket
     - recibe Opus frames por push_opus_frame() y los inyecta en appsrc
     """
-    def __init__(self, loop, ws):
+    def __init__(self, loop: asyncio.AbstractEventLoop, ws):
         self.loop = loop
         self.ws = ws
         self.cand_out = 0
@@ -97,7 +112,6 @@ class Publisher:
             raise RuntimeError("appsrc 'opussrc' not found")
 
         # Caps para Opus "raw" (paquetes Opus) que vienen del motor C
-        # Nota: opusparse suele funcionar bien si le entregas frames Opus completos.
         caps = Gst.Caps.from_string("audio/x-opus, rate=48000, channels=1")
         self.appsrc.set_property("caps", caps)
 
@@ -108,15 +122,15 @@ class Publisher:
         bus.add_signal_watch()
         bus.connect("message", self.on_bus)
 
-        # Control simple de timestamps (si quieres fijar PTS/DUR exactos)
         self._running = False
-        self._pts = 0  # en nanosegundos
+        self._pts = 0  # ns
 
     def start(self):
         if not self.glib_thread.is_alive():
             self.glib_thread.start()
         self.pipe.set_state(Gst.State.PLAYING)
         self._running = True
+        self._pts = 0
         print("[SENSOR] Pipeline PLAYING (Opus over TCP -> WebRTC)")
 
     def stop(self):
@@ -149,7 +163,7 @@ class Publisher:
         self.cand_out += 1
         if self.cand_out <= 3:
             print(f"[SENSOR] local candidate #{self.cand_out} mline={mline} head='{candidate[:60]}'")
-        self._ws_send({"type":"candidate","mlineindex":int(mline),"candidate":candidate})
+        self._ws_send({"type": "candidate", "mlineindex": int(mline), "candidate": candidate})
 
     def on_negotiation_needed(self, element):
         print("[SENSOR] negotiation needed")
@@ -181,9 +195,9 @@ class Publisher:
 
         element.emit("set-local-description", offer, Gst.Promise.new())
         print("[SENSOR] sending OFFER")
-        self._ws_send({"type":"offer","sdp":sdp_text})
+        self._ws_send({"type": "offer", "sdp": sdp_text})
 
-    def set_answer(self, sdp_text):
+    def set_answer(self, sdp_text: str):
         def _do():
             res, sdp = GstSdp.sdp_message_new()
             if res != GstSdp.SDPResult.OK:
@@ -199,6 +213,7 @@ class Publisher:
             self.webrtc.emit("set-remote-description", ans, Gst.Promise.new())
             print("[SENSOR] answer set")
             return False
+
         GLib.idle_add(_do)
 
     def add_candidate(self, mline, cand):
@@ -210,12 +225,11 @@ class Publisher:
     def push_opus_frame(self, opus_bytes: bytes, frame_ms: int = DEFAULT_FRAME_MS):
         """
         Inyecta un frame Opus (payload) en appsrc.
-        Se ejecuta vía GLib.idle_add para mantener thread-safety con GStreamer.
+        Thread-safe: se agenda con GLib.idle_add().
         """
         if not self._running:
             return
 
-        # Duración típica por frame (20ms) en nanosegundos
         dur_ns = int(frame_ms * 1e6)
 
         def _do():
@@ -225,13 +239,11 @@ class Publisher:
             buf = Gst.Buffer.new_allocate(None, len(opus_bytes), None)
             buf.fill(0, opus_bytes)
 
-            # Si quieres timestamps deterministas:
             buf.pts = self._pts
             buf.dts = self._pts
             buf.duration = dur_ns
             self._pts += dur_ns
 
-            # Push al appsrc
             ret = self.appsrc.emit("push-buffer", buf)
             if ret != Gst.FlowReturn.OK:
                 print("[SENSOR][WARN] push-buffer flow:", ret)
@@ -240,18 +252,19 @@ class Publisher:
         GLib.idle_add(_do)
 
 
-async def tcp_reader_task(pub: Publisher):
+# =========================
+# TCP server (persistente)
+# =========================
+async def tcp_server_forever():
     """
-    Levanta un servidor TCP (un solo cliente) que recibe:
+    Servidor TCP persistente (SIEMPRE arriba) que recibe frames del motor C:
       hdr (OPU0 + seq + sr + ch + plen) + payload(opus)
-    y lo entrega a pub.push_opus_frame().
+    y los pone en la cola global opus_q.
     """
-    client_connected = asyncio.Event()
 
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
         print(f"[TCP] Motor C conectado desde {peer}")
-        client_connected.set()
 
         frames = 0
         bytes_ = 0
@@ -267,15 +280,24 @@ async def tcp_reader_task(pub: Publisher):
                     print("[TCP] Magic inválido (no es OPU0). Cerrando.")
                     break
 
+                if plen <= 0 or plen > MAX_OPUS_FRAME_BYTES:
+                    print(f"[TCP] plen inválido={plen}. Cerrando (posible desincronización).")
+                    break
+
                 payload = await reader.readexactly(plen)
 
                 if last_seq is not None and seq != (last_seq + 1):
                     print(f"[TCP] WARNING: salto de seq {last_seq} -> {seq}")
                 last_seq = seq
 
-                # Si tu motor puede cambiar sr/ch, aquí podrías validar:
-                # (por ahora asumimos 48kHz mono como en tu CFG)
-                pub.push_opus_frame(payload, frame_ms=DEFAULT_FRAME_MS)
+                # Backpressure: si la cola está llena, descartamos el más viejo
+                if opus_q.full():
+                    try:
+                        _ = opus_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+
+                await opus_q.put(payload)
 
                 frames += 1
                 bytes_ += (HDR_SIZE + plen)
@@ -301,24 +323,40 @@ async def tcp_reader_task(pub: Publisher):
     server = await asyncio.start_server(handle_client, TCP_HOST, TCP_PORT)
     print(f"[TCP] Escuchando motor C en {TCP_HOST}:{TCP_PORT}")
 
-    async with server:
-        # Espera a que al menos un cliente conecte.
-        await client_connected.wait()
-        # Luego mantenemos el server vivo hasta que lo cancelen desde afuera.
-        await server.serve_forever()
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
+# =========================
+# Pump: cola TCP -> Publisher (por sesión WebRTC)
+# =========================
+async def pump_queue_to_publisher(pub: Publisher):
+    """
+    Consume frames Opus desde opus_q y los inyecta en el Publisher actual.
+    Si WebRTC cae y se recrea Publisher, este task se cancela y se crea otro.
+    """
+    while True:
+        payload = await opus_q.get()
+        pub.push_opus_frame(payload, frame_ms=DEFAULT_FRAME_MS)
+
+
+# =========================
+# WebRTC session
+# =========================
 async def run_one_session():
     async with websockets.connect(SIGNAL_URL, open_timeout=20, max_size=None) as ws:
-        await ws.send(json.dumps({"role":"sensor","sensor_id":SENSOR_ID}))
+        await ws.send(json.dumps({"role": "sensor", "sensor_id": SENSOR_ID}))
         print("[GW] Connected to signaling server")
-        loop = asyncio.get_running_loop()
 
+        loop = asyncio.get_running_loop()
         pub = Publisher(loop, ws)
         pub.start()
 
-        # Arranca la recepción TCP del motor C (en paralelo)
-        tcp_task = asyncio.create_task(tcp_reader_task(pub))
+        pump_task = asyncio.create_task(pump_queue_to_publisher(pub))
 
         try:
             async for msg in ws:
@@ -328,15 +366,21 @@ async def run_one_session():
                 elif obj.get("type") == "candidate":
                     pub.add_candidate(obj["mlineindex"], obj["candidate"])
         finally:
-            tcp_task.cancel()
+            pump_task.cancel()
             try:
-                await tcp_task
+                await pump_task
             except Exception:
                 pass
             pub.stop()
 
 
+# =========================
+# Main
+# =========================
 async def main():
+    # TCP server siempre arriba, independiente de WebRTC reconexiones
+    tcp_task = asyncio.create_task(tcp_server_forever())
+
     while True:
         try:
             await run_one_session()
@@ -357,6 +401,7 @@ async def main():
             print(f"[GW] Unexpected error: {e}\n{traceback.format_exc()}\nRetrying in {RETRY_SECONDS}s...")
 
         await asyncio.sleep(RETRY_SECONDS)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
