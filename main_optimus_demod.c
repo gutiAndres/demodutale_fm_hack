@@ -35,7 +35,7 @@
 #define SAMPLE_RATE_RF_IN       19200000/2   /* 19.2 MHz */
 
 /* Demod Fs (narrower) */
-#define SAMPLE_RATE_DEMOD       1920000/2    /* 1.92 MHz */
+#define SAMPLE_RATE_DEMOD       1920000    /* 1.92 MHz */
 
 /* Must be integer */
 #define DECIM_FACTOR            (SAMPLE_RATE_RF_IN / SAMPLE_RATE_DEMOD)
