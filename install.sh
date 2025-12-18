@@ -1,114 +1,99 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=============================================="
-echo " WebRTC Opus Publisher – system install script"
-echo "=============================================="
+echo "========================================"
+echo " WebRTC Sensor – Dependency Installer"
+echo " Raspberry Pi OS / Debian"
+echo "========================================"
 
-# ---------- sanity ----------
-if [[ $EUID -ne 0 ]]; then
-  echo "[ERROR] Run this script with sudo"
-  exit 1
-fi
+# -----------------------------
+# 1) Update system
+# -----------------------------
+echo "[1/6] Updating system..."
+sudo apt update
+sudo apt -y upgrade
 
-echo "[INFO] Updating system..."
-apt update
+# -----------------------------
+# 2) Install system packages
+# -----------------------------
+echo "[2/6] Installing system dependencies..."
 
-# ---------- base ----------
-echo "[INFO] Installing base packages..."
-apt install -y \
-  ca-certificates \
-  curl \
-  wget \
-  git \
-  build-essential \
-  pkg-config \
-  software-properties-common
-
-# ---------- python ----------
-echo "[INFO] Installing Python runtime..."
-apt install -y \
-  python3 \
-  python3-pip \
-  python3-venv \
-  python3-gi \
-  python3-gi-cairo
-
-# ---------- gstreamer core ----------
-echo "[INFO] Installing GStreamer core..."
-apt install -y \
+sudo apt install -y \
+  python3 python3-venv python3-pip python3-gi \
+  gir1.2-gstreamer-1.0 \
+  gir1.2-gst-plugins-base-1.0 \
+  gir1.2-gst-plugins-bad-1.0 \
   gstreamer1.0-tools \
   gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad \
   gstreamer1.0-plugins-ugly \
-  gstreamer1.0-libav
+  gstreamer1.0-libav \
+  gstreamer1.0-alsa \
+  ca-certificates
 
-# ---------- WebRTC / ICE / Opus ----------
-echo "[INFO] Installing WebRTC / Opus / ICE dependencies..."
-apt install -y \
-  gstreamer1.0-nice \
-  gstreamer1.0-opus \
-  libnice10 \
-  libnice-dev \
-  libsrtp2-1 \
-  libssl3
+# -----------------------------
+# 3) Create Python venv
+# -----------------------------
+echo "[3/6] Creating Python virtual environment..."
 
-# ---------- WebRTC GIR bindings ----------
-echo "[INFO] Installing GstWebRTC GIR bindings..."
-apt install -y \
-  gir1.2-gst-webrtc-1.0 \
-  gir1.2-gst-sdp-1.0
+if [ ! -d "venv" ]; then
+  python3 -m venv --system-site-packages venv
+fi
 
-# ---------- Python deps ----------
-echo "[INFO] Installing Python packages..."
-python3 -m pip install --upgrade pip
-python3 -m pip install \
-  websockets
+# shellcheck disable=SC1091
+source venv/bin/activate
 
-# ---------- validation ----------
-echo "=============================================="
-echo " Validating installation"
-echo "=============================================="
+# -----------------------------
+# 4) Install Python packages
+# -----------------------------
+echo "[4/6] Installing Python packages..."
 
-echo "[CHECK] Python GI..."
-python3 - <<'EOF'
+python -m pip install --upgrade pip
+python -m pip install websockets==15.0.1
+
+# -----------------------------
+# 5) Sanity checks (GStreamer)
+# -----------------------------
+echo "[5/6] Verifying GStreamer plugins..."
+
+gst-inspect-1.0 webrtcbin >/dev/null || {
+  echo "[ERROR] webrtcbin NOT found. gstreamer1.0-plugins-bad is missing."
+  exit 1
+}
+
+gst-inspect-1.0 opusparse >/dev/null || {
+  echo "[ERROR] opusparse NOT found."
+  exit 1
+}
+
+gst-inspect-1.0 rtpopuspay >/dev/null || {
+  echo "[ERROR] rtpopuspay NOT found."
+  exit 1
+}
+
+# -----------------------------
+# 6) Sanity checks (Python GI)
+# -----------------------------
+echo "[6/6] Verifying Python GI bindings..."
+
+python - <<'EOF'
 import gi
 gi.require_version("Gst", "1.0")
 gi.require_version("GstWebRTC", "1.0")
-from gi.repository import Gst
+gi.require_version("GstSdp", "1.0")
+gi.require_version("GLib", "2.0")
+
+from gi.repository import Gst, GstWebRTC, GstSdp, GLib
 Gst.init(None)
-print("  OK: gi + Gst + GstWebRTC")
+
+print("✔ Python GI OK")
+print("✔ GStreamer version:", Gst.version_string())
+print("✔ GstWebRTC available")
 EOF
 
-echo "[CHECK] webrtcbin..."
-if gst-inspect-1.0 webrtcbin > /dev/null 2>&1; then
-  echo "  OK: webrtcbin present"
-else
-  echo "  ERROR: webrtcbin NOT found"
-  exit 1
-fi
-
-echo "[CHECK] opusenc..."
-if gst-inspect-1.0 opusenc > /dev/null 2>&1; then
-  echo "  OK: opusenc present"
-else
-  echo "  ERROR: opusenc NOT found"
-  exit 1
-fi
-
-echo "[CHECK] rtpopuspay..."
-if gst-inspect-1.0 rtpopuspay > /dev/null 2>&1; then
-  echo "  OK: rtpopuspay present"
-else
-  echo "  ERROR: rtpopuspay NOT found"
-  exit 1
-fi
-
-echo "=============================================="
-echo " INSTALLATION COMPLETE"
-echo "=============================================="
-echo
-echo "You can now run:"
-echo "  python3 sensor_webrtc_publisher.py"
-echo
+echo "========================================"
+echo " Installation completed successfully"
+echo " Activate env with: source venv/bin/activate"
+echo " Run your code with: python3 sensor_webrtc_publisher.py"
+echo "========================================"
