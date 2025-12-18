@@ -4,10 +4,10 @@ import time
 import websockets
 
 TCP_HOST = "0.0.0.0"
-TCP_PORT = 9000
+TCP_PORT = 8000
 
-SENSOR_ID = "ANE1"
-SERVER_WS = f"ws://localhost:8000/ws/sensor/{SENSOR_ID}"
+SENSOR_ID = "d8:3a:dd:f7:1a:cc"
+SERVER_WS = f"ws://localhost:3000/ws/sensor/{SENSOR_ID}" #"wss://rsm.ane.gov.co:12443/ws/audio/sensor/{SENSOR_ID}"
 
 HDR_FMT = "!IIIHH"  # magic, seq, sample_rate, channels, payload_len
 HDR_SIZE = struct.calcsize(HDR_FMT)
@@ -80,7 +80,7 @@ async def handle_client(reader, writer):
             pass
         writer.close()
         await writer.wait_closed()
-        print("[PY] Sesión cerrada.")
+        print("[PY] Sesión  cerrada.")
 
 async def main():
     server = await asyncio.start_server(handle_client, TCP_HOST, TCP_PORT)

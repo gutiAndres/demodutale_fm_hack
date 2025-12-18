@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<body>
+    <h2>WebRTC Opus Stream</h2>
+    <button onclick="start()">Connect & Play</button>
+    <audio id="remoteAudio" autoplay controls></audio>
+
+    <script>
+        const pc = new RTCPeerConnection({
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+        });
+
+        const ws = new WebSocket("ws://localhost:8000/ws/signal/d8:3a:dd:f7:1a:cc");
+
+        // Handle incoming audio stream
+        pc.ontrack = (event) => {
+            document.getElementById("remoteAudio").srcObject = event.streams[0];
+        };
+
+        ws.onmessage = async (msg) => {
+            const data = JSON.parse(msg.data);
+            if (data.type === "offer") {
+                await pc.setRemoteDescription(new RTCSessionDescription(data));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                ws.send(JSON.stringify({ type: "answer", sdp: pc.localDescription.sdp }));
+            } else if (data.type === "candidate") {
+                await pc.addIceCandidate(new RTCIceCandidate(data));
+            }
+        };
+
+        async function start() {
+            ws.send(JSON.stringify({ role: "viewer" }));
+            console.log("Waiting for sensor offer...");
+        }
+
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                ws.send(JSON.stringify({
+                    type: "candidate",
+                    candidate: event.candidate.candidate,
+                    mlineindex: event.candidate.sdpMLineIndex
+                }));
+            }
+        };
+    </script>
+</body>
+</html>

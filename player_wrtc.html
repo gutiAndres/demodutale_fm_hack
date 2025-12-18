@@ -1,13 +1,19 @@
 <!doctype html>
 <html>
-<head><meta charset="utf-8" /><title>ANE FM Player (Opus->PCM server)</title></head>
+<head>
+  <meta charset="utf-8" />
+  <title>ANE Audio Player (PCM over WS)</title>
+</head>
 <body>
   <button id="start">Start Audio</button>
   <pre id="log"></pre>
 
 <script>
-const SENSOR_ID = "d8:3a:dd:f7:1a:cc";
-const WS_URL = `ws://localhost:3000/ws/listen/${SENSOR_ID}`;
+const SENSOR_ID = "d8:3a:dd:f7:1a:cc";  // DEBE coincidir con el sensor_id del server
+
+const proto = (location.protocol === "https:") ? "wss" : "ws";
+const WS_URL = `${proto}://${location.host}/ws/listen/${encodeURIComponent(SENSOR_ID)}`;
+
 const logEl = document.getElementById("log");
 const log = (s) => (logEl.textContent += s + "\n");
 
@@ -17,7 +23,7 @@ let started = false;
 
 let sampleRate = 48000;
 let queue = [];
-const TARGET_BUFFER_FRAMES = 10; // 200 ms
+const TARGET_BUFFER_FRAMES = 10; // 10 * 20ms = 200ms
 
 let framesRx = 0;
 let t0 = performance.now();
@@ -66,16 +72,15 @@ document.getElementById("start").onclick = async () => {
   ws.binaryType = "arraybuffer";
 
   ws.onopen = () => log("[UI] WS conectado: " + WS_URL);
-  ws.onclose = () => log("[UI] WS cerrado.");
+  ws.onclose = (e) => log("[UI] WS cerrado. code=" + e.code);
+  ws.onerror = (e) => log("[UI] WS error (mira consola del navegador).");
 
   ws.onmessage = (ev) => {
     if (typeof ev.data === "string") {
-      log("[UI] State: " + ev.data);
+      log("[UI] CFG: " + ev.data);
       try {
         const cfg = JSON.parse(ev.data);
         if (cfg.sample_rate) sampleRate = cfg.sample_rate;
-        if (cfg.frequency) log("[UI] frequency=" + cfg.frequency);
-        if (cfg.modulation) log("[UI] modulation=" + cfg.modulation);
       } catch {}
       started = true;
       return;
@@ -85,6 +90,9 @@ document.getElementById("start").onclick = async () => {
     const dv = new DataView(ab);
 
     // Header PCM: magic(4) seq(4) sample_rate(4) channels(2) samples(2) big-endian
+    const magic = dv.getUint32(0, false);
+    if (magic !== 0x41554430) return; // 'AUD0'
+
     const sr = dv.getUint32(8, false);
     const ns = dv.getUint16(14, false);
     if (sr) sampleRate = sr;

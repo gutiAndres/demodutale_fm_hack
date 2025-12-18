@@ -1,252 +1,188 @@
-// fm_stream_opus_to_python.c
 #include <stdio.h>
-#include <stdlib.h>
 #include <stdint.h>
-#include <math.h>
-#include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-
+#include <pthread.h>
+#include <stdatomic.h>
 #include <libhackrf/hackrf.h>
-#include <opus/opus.h>
+#include <math.h>
 
+#include "rb_sig.h"
+#include "fm_demod.h"
+#include "opus_tx.h"
+
+/* ===================== CONFIG ===================== */
 #define FREQ_HZ            103700000
 #define SAMPLE_RATE_RF     1920000
 #define SAMPLE_RATE_AUDIO  48000
-#define DECIMATION         40   
+#define DECIMATION         40
+
 #define FRAME_MS           20
 #define FRAME_SAMPLES      ((SAMPLE_RATE_AUDIO * FRAME_MS) / 1000)
 
 #define PY_HOST            "127.0.0.1"
 #define PY_PORT            9000
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-#pragma pack(push, 1)
-typedef struct {
-    uint32_t magic;
-    uint32_t seq;
-    uint32_t sample_rate;
-    uint16_t channels;
-    uint16_t payload_len;
-} OpusFrameHeader;
-#pragma pack(pop)
+#define IQ_RB_SIZE_BYTES   (2 * 1024 * 1024)
+#define PCM_RB_SIZE_BYTES  (256 * 1024)
 
 /* ===================== ESTADO GLOBAL ===================== */
+static atomic_int g_stop = 0;
 
-static float last_phase = 0.0f;
-static int sock_fd = -1;
-static volatile int g_stop = 0;
+static rb_sig_t g_iq_rb;
+static rb_sig_t g_pcm_rb;
+static atomic_ulong g_iq_dropped_bytes = 0;
 
-static uint32_t g_seq = 0;
-static int16_t  g_pcm_frame[FRAME_SAMPLES];
-static int      g_pcm_idx = 0;
+static opus_tx_t *g_tx = NULL;
 
-static const float g_audio_gain = 8000.0f;
-static OpusEncoder* g_enc = NULL;
-
-/* ===================== OPUS ===================== */
-
-static const int OPUS_BITRATE = 64000;
-static const int OPUS_COMPLEXITY = 5;
-static const int OPUS_VBR = 1;
-
-/* ===================== ESTIMACIÓN EXCURSIÓN FM ===================== */
-
-static float g_fm_dev_max = 0.0f;     // pico ventana (Hz)
-static float g_fm_dev_ema = 0.0f;     // suavizado (Hz)
-static int   g_dev_counter = 0;
-
-#define DEV_EMA_ALPHA 0.01f
-#define DEV_REPORT_SAMPLES (SAMPLE_RATE_RF / 10)  // 100 ms
-
-static inline float phase_diff_to_hz(float dphi) {
-    return (dphi * SAMPLE_RATE_RF) / (2.0f * M_PI);
-}
-
-static inline void update_fm_deviation(float phase_diff) {
-    float fi_hz = fabsf(phase_diff_to_hz(phase_diff));
-
-    if (fi_hz > g_fm_dev_max)
-        g_fm_dev_max = fi_hz;
-
-    g_fm_dev_ema = (1.0f - DEV_EMA_ALPHA) * g_fm_dev_ema
-                   + DEV_EMA_ALPHA * fi_hz;
-
-    g_dev_counter++;
-
-    if (g_dev_counter >= DEV_REPORT_SAMPLES) {
-        printf("[FM] Excursion pico: %.1f kHz | EMA: %.1f kHz\n",
-               g_fm_dev_max / 1e3,
-               g_fm_dev_ema / 1e3);
-
-        g_fm_dev_max = 0.0f;
-        g_dev_counter = 0;
-    }
-}
-
-/* ===================== FM DEMOD ===================== */
-
-static float demodulate_fm(float i, float q) {
-    float current_phase = atan2f(q, i);
-    float phase_diff = current_phase - last_phase;
-
-    if (phase_diff > M_PI)  phase_diff -= 2.0f * M_PI;
-    if (phase_diff < -M_PI) phase_diff += 2.0f * M_PI;
-
-    last_phase = current_phase;
-    return phase_diff;
-}
-
-static inline int16_t float_to_i16(float x) {
-    float y = x * g_audio_gain;
-    if (y > 32767.0f) y = 32767.0f;
-    if (y < -32768.0f) y = -32768.0f;
-    return (int16_t)lrintf(y);
-}
-
-/* ===================== TCP ===================== */
-
-static int send_all(int fd, const void *buf, size_t n) {
-    const uint8_t *p = (const uint8_t*)buf;
-    while (n > 0) {
-        ssize_t w = send(fd, p, n, 0);
-        if (w <= 0) return -1;
-        p += (size_t)w;
-        n -= (size_t)w;
-    }
-    return 0;
-}
-
-static int send_opus_packet(const uint8_t* opus, uint16_t len) {
-    OpusFrameHeader h;
-    h.magic = htonl(0x4F505530);
-    h.seq = htonl(g_seq++);
-    h.sample_rate = htonl(SAMPLE_RATE_AUDIO);
-    h.channels = htons(1);
-    h.payload_len = htons(len);
-
-    if (send_all(sock_fd, &h, sizeof(h)) != 0) return -1;
-    if (send_all(sock_fd, opus, len) != 0) return -1;
-    return 0;
-}
-
-/* ===================== HACKRF RX ===================== */
-
+/* ===================== HACKRF CALLBACK ===================== */
 static int rx_callback(hackrf_transfer* transfer) {
-    if (g_stop) return 0;
+    if (atomic_load(&g_stop)) return 0;
 
-    int8_t* buf = (int8_t*)transfer->buffer;
-    int count = transfer->valid_length / 2;
+    size_t w = rb_sig_write(&g_iq_rb, transfer->buffer, (size_t)transfer->valid_length);
+    if (w < (size_t)transfer->valid_length) {
+        atomic_fetch_add(&g_iq_dropped_bytes,
+            (unsigned long)((size_t)transfer->valid_length - w));
+    }
+    return 0;
+}
 
-    float sum_audio = 0.0f;
-    int dec_counter = 0;
-    uint8_t opus_out[1500];
+/* ===================== DSP THREAD ===================== */
+static void* dsp_thread_fn(void* arg) {
+    (void)arg;
 
-    for (int j = 0; j < count; j++) {
-        float i = (float)buf[2*j]     / 128.0f;
-        float q = (float)buf[2*j + 1] / 128.0f;
+    fm_demod_t dem;
+    fm_demod_init(&dem, SAMPLE_RATE_RF, DECIMATION, 8000.0f);
 
-        float fm = demodulate_fm(i, q);
+    enum { IQ_CHUNK = 16384 };
+    uint8_t iq_bytes[IQ_CHUNK];
 
-        /* ---- ESTIMACIÓN EXCURSIÓN FM ---- */
-        update_fm_deviation(fm);
+    while (!atomic_load(&g_stop)) {
+        size_t got = rb_sig_read_blocking(&g_iq_rb, iq_bytes, 2, &g_stop);
+        if (got == 0) break;
 
-        sum_audio += fm;
-        dec_counter++;
+        size_t more = rb_sig_read(&g_iq_rb, iq_bytes + got, IQ_CHUNK - got);
+        got += more;
+        got = (got / 2) * 2; // par I/Q
 
-        if (dec_counter == DECIMATION) {
-            float audio_out = sum_audio / (float)DECIMATION;
-            g_pcm_frame[g_pcm_idx++] = float_to_i16(audio_out);
+        int8_t *buf = (int8_t*)iq_bytes;
+        int count = (int)(got / 2);
 
-            if (g_pcm_idx == FRAME_SAMPLES) {
-                int n = opus_encode(g_enc, g_pcm_frame, FRAME_SAMPLES,
-                                    opus_out, sizeof(opus_out));
-                if (n < 0) {
-                    fprintf(stderr, "[C] opus_encode error: %s\n",
-                            opus_strerror(n));
-                    g_stop = 1;
-                    break;
-                }
+        for (int j = 0; j < count && !atomic_load(&g_stop); j++) {
+            float i = (float)buf[2*j]     / 128.0f;
+            float q = (float)buf[2*j + 1] / 128.0f;
 
-                if (send_opus_packet(opus_out, (uint16_t)n) != 0) {
-                    fprintf(stderr, "[C] Error enviando Opus\n");
-                    g_stop = 1;
-                    break;
-                }
+            // phase diff (FM)
+            float dphi = fm_demod_phase_diff(&dem, i, q);
 
-                g_pcm_idx = 0;
+            // métricas excursión (fuera del callback)
+            fm_dev_report_t rep = fm_demod_update_deviation(&dem, dphi);
+            if (rep.ready) {
+                printf("[FM] Excursion pico: %.1f kHz | EMA: %.1f kHz | IQ drops: %lu bytes\n",
+                       rep.dev_peak_khz, rep.dev_ema_khz,
+                       (unsigned long)atomic_load(&g_iq_dropped_bytes));
             }
 
-            sum_audio = 0.0f;
-            dec_counter = 0;
+            // decimación simple a audio (reusa dphi acumulado)
+            dem.sum_audio += dphi;
+            dem.dec_counter++;
+            if (dem.dec_counter == dem.decimation) {
+                float audio = dem.sum_audio / (float)dem.decimation;
+                int16_t s16 = (int16_t)lrintf(fmaxf(fminf(audio * dem.audio_gain, 32767.0f), -32768.0f));
+                rb_sig_write(&g_pcm_rb, &s16, sizeof(s16));
+                dem.sum_audio = 0.0f;
+                dem.dec_counter = 0;
+            }
         }
-
-        if (g_stop) break;
     }
-
-    return 0;
+    return NULL;
 }
 
-/* ===================== MAIN ===================== */
+/* ===================== NET/OPUS THREAD ===================== */
+static void* net_thread_fn(void* arg) {
+    (void)arg;
 
-static int connect_to_python(void) {
-    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd < 0) return -1;
+    int16_t frame[FRAME_SAMPLES];
 
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(PY_PORT);
-    inet_pton(AF_INET, PY_HOST, &addr.sin_addr);
+    while (!atomic_load(&g_stop)) {
+        size_t need = FRAME_SAMPLES * sizeof(int16_t);
+        size_t got = rb_sig_read_blocking(&g_pcm_rb, frame, need, &g_stop);
+        if (got == 0) break;
 
-    if (connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-        close(sock_fd);
-        sock_fd = -1;
-        return -1;
+        if (opus_tx_send_frame(g_tx, frame, FRAME_SAMPLES) != 0) {
+            fprintf(stderr, "[C] Error enviando Opus\n");
+            atomic_store(&g_stop, 1);
+            break;
+        }
     }
-    return 0;
+    return NULL;
 }
 
 int main(void) {
+    // 1) Opus TX
+    opus_tx_cfg_t ocfg = {
+        .sample_rate = SAMPLE_RATE_AUDIO,
+        .channels = 1,
+        .bitrate = 64000,
+        .complexity = 5,
+        .vbr = 1
+    };
+
     printf("[C] Conectando a Python %s:%d ...\n", PY_HOST, PY_PORT);
-    if (connect_to_python() != 0) {
-        fprintf(stderr, "[C] No pude conectar a Python\n");
+    g_tx = opus_tx_create(PY_HOST, PY_PORT, &ocfg);
+    if (!g_tx) {
+        fprintf(stderr, "[C] No pude crear Opus/TCP\n");
         return 1;
     }
 
-    int err = 0;
-    g_enc = opus_encoder_create(SAMPLE_RATE_AUDIO, 1,
-                                OPUS_APPLICATION_AUDIO, &err);
-    opus_encoder_ctl(g_enc, OPUS_SET_BITRATE(OPUS_BITRATE));
-    opus_encoder_ctl(g_enc, OPUS_SET_COMPLEXITY(OPUS_COMPLEXITY));
-    opus_encoder_ctl(g_enc, OPUS_SET_VBR(OPUS_VBR));
+    // 2) RBs
+    rb_sig_init(&g_iq_rb, IQ_RB_SIZE_BYTES);
+    rb_sig_init(&g_pcm_rb, PCM_RB_SIZE_BYTES);
 
+    // 3) HackRF
     hackrf_init();
-    hackrf_device* device = NULL;
-    hackrf_open(&device);
+    hackrf_device *dev = NULL;
+    if (hackrf_open(&dev) != HACKRF_SUCCESS) {
+        fprintf(stderr, "[C] hackrf_open fallo\n");
+        return 1;
+    }
 
-    hackrf_set_sample_rate(device, SAMPLE_RATE_RF);
-    hackrf_set_freq(device, FREQ_HZ);
-    hackrf_set_lna_gain(device, 32);
-    hackrf_set_vga_gain(device, 28);
-    hackrf_set_amp_enable(device, 0);
+    hackrf_set_sample_rate(dev, SAMPLE_RATE_RF);
+    hackrf_set_freq(dev, FREQ_HZ);
+    hackrf_set_lna_gain(dev, 32);
+    hackrf_set_vga_gain(dev, 28);
+    hackrf_set_amp_enable(dev, 0);
 
-    printf("[C] RX FM %.1f MHz\n", (float)FREQ_HZ / 1e6);
-    hackrf_start_rx(device, rx_callback, NULL);
+    // 4) Threads
+    pthread_t th_dsp, th_net;
+    pthread_create(&th_dsp, NULL, dsp_thread_fn, NULL);
+    pthread_create(&th_net, NULL, net_thread_fn, NULL);
+
+    printf("[C] RX FM %.1f MHz | FsRF=%d | DECIM=%d -> FsAudio~%d\n",
+           (float)FREQ_HZ / 1e6f, SAMPLE_RATE_RF, DECIMATION, SAMPLE_RATE_RF / DECIMATION);
+
+    // 5) RX
+    hackrf_start_rx(dev, rx_callback, NULL);
 
     printf("[C] ENTER para detener...\n");
     getchar();
+    atomic_store(&g_stop, 1);
 
-    g_stop = 1;
-    hackrf_stop_rx(device);
-    hackrf_close(device);
+    // 6) Stop + join
+    hackrf_stop_rx(dev);
+    hackrf_close(dev);
     hackrf_exit();
 
-    if (sock_fd >= 0) close(sock_fd);
-    opus_encoder_destroy(g_enc);
+    rb_sig_wake_all(&g_iq_rb);
+    rb_sig_wake_all(&g_pcm_rb);
+
+    pthread_join(th_dsp, NULL);
+    pthread_join(th_net, NULL);
+
+    // 7) Cleanup
+    opus_tx_destroy(g_tx);
+    rb_sig_free(&g_iq_rb);
+    rb_sig_free(&g_pcm_rb);
 
     printf("[C] Finalizado\n");
     return 0;
